@@ -1,12 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - master
-  pull_request:
-    branches:
-      - master
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional surefire -Dtest selector; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -27,6 +27,7 @@ jobs:
             java: 21
             root-pom: pom.xml
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
     env:
       ROOT_POM: ${{ matrix.root-pom }}
     steps:
@@ -54,7 +55,69 @@ jobs:
         run: ./mvnw -B -ntp -Dtoolchain.skip install -U -DskipTests=true -f $ROOT_POM
       - name: 'Test'
         shell: bash
-        run: ./mvnw -B -ntp -P!standard-with-extra-repos -Dtoolchain.skip verify -U -Dmaven.javadoc.skip=true -Dsurefire.toolchain.version=${{ matrix.java }} -f $ROOT_POM
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./mvnw -B -ntp -P!standard-with-extra-repos -Dtoolchain.skip verify -U -Dmaven.javadoc.skip=true -Dsurefire.toolchain.version=${{ matrix.java }} -f $ROOT_POM -Dtest="${{ inputs.test-filter }}" -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw -B -ntp -P!standard-with-extra-repos -Dtoolchain.skip verify -U -Dmaven.javadoc.skip=true -Dsurefire.toolchain.version=${{ matrix.java }} -f $ROOT_POM
+          fi
+      - name: 'Print skipped tests with reasons'
+        if: ${{ always() }}
+        shell: bash
+        # Surefire's console output gives only a skip count; list each skipped test with the
+        # recorded reason (or the assume() line from its source), plus per-module totals.
+        run: |
+          if python3 -c '' 2>/dev/null; then PY=python3; else PY=python; fi
+          $PY - <<'PYEOF'
+          import glob
+          import os
+          import re
+          import xml.etree.ElementTree as ET
+
+          totals = {}
+          for path in sorted(glob.glob("android/*/target/surefire-reports/TEST-*.xml") +
+                             glob.glob("*/target/surefire-reports/TEST-*.xml")):
+              module = path.replace("\\", "/").split("/target/")[0]
+              try:
+                  root = ET.parse(path).getroot()
+              except ET.ParseError as e:
+                  print(f"[skip-report] could not parse {path}: {e}")
+                  continue
+              t = totals.setdefault(module, [0, 0, 0, 0])
+              t[0] += int(root.get("tests", 0))
+              t[1] += int(root.get("failures", 0))
+              t[2] += int(root.get("errors", 0))
+              t[3] += int(root.get("skipped", 0))
+              for tc in root.iter("testcase"):
+                  sk = tc.find("skipped")
+                  if sk is None:
+                      continue
+                  cls, name = tc.get("classname", "?"), tc.get("name", "?")
+                  reason = (sk.get("message") or (sk.text or "")).strip().splitlines()
+                  reason = reason[0] if reason else ""
+                  if not reason:
+                      method = re.sub(r"[\[(].*", "", name)
+                      src = glob.glob(f"{module}/test/{cls.replace('.', '/')}.java")
+                      if src:
+                          body = open(src[0], encoding="utf-8").read()
+                          m = re.search(r"void " + re.escape(method) + r"\(.*?\n  \}", body, re.S)
+                          if m:
+                              lines = [l.strip() for l in m.group(0).splitlines() if "assume" in l]
+                              if lines:
+                                  reason = "assumption not met: " + lines[0]
+                  print(f"SKIPPED {cls}.{name} -- reason: {reason or '(no message recorded)'}")
+
+          for module, (n, f, e, s) in sorted(totals.items()):
+              print(f"[surefire summary] {module}: tests={n} passed={n - f - e - s} "
+                    f"failures={f} errors={e} skipped={s}")
+          PYEOF
+      - name: 'Upload guava jar'
+        if: matrix.os == 'ubuntu-latest' && matrix.java == 17 && matrix.root-pom == 'pom.xml'
+        uses: actions/upload-artifact@v4
+        with:
+          name: guava-jar
+          path: guava/target/guava-33.6.0-jre.jar
+          if-no-files-found: error
       - name: 'Print Surefire reports'
         # Note: Normally a step won't run if the job has failed, but this causes it to
         if: ${{ failure() }}
@@ -73,6 +136,7 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: 'Check out repository'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -100,6 +164,7 @@ jobs:
     needs: test
     if: github.event_name == 'push' && github.repository == 'google/guava'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: 'Check out repository'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
